@@ -8,9 +8,6 @@ from sklearn.preprocessing import LabelEncoder
 import warnings
 warnings.filterwarnings("ignore")
 
-# ==============================================================================
-# SECTION 1 -- LOAD & CLEAN
-# ==============================================================================
 
 def load_and_clean(path):
     print("Loading data...")
@@ -44,9 +41,6 @@ def load_and_clean(path):
     return df
 
 
-# ==============================================================================
-# SECTION 2 -- AGGREGATE
-# ==============================================================================
 
 def build_aggregations(df):
     print("Building aggregations...")
@@ -107,7 +101,6 @@ def build_aggregations(df):
                    .reset_index())
     by_charge["ChurnRate"] = by_charge["Churned"] / by_charge["Total"] * 100
 
-    # -- Retention curve (survival by tenure month) ----------------------------
     retention = []
     for t in range(1, 73):
         cohort = df[df["tenure"] >= t]
@@ -116,7 +109,6 @@ def build_aggregations(df):
         retention.append({"Tenure": t, "RetentionRate": rate, "Customers": len(cohort)})
     retention_df = pd.DataFrame(retention)
 
-    # -- Churn reasons breakdown (services) ------------------------------------
     services = ["PhoneService","MultipleLines","InternetService",
                 "OnlineSecurity","OnlineBackup","DeviceProtection",
                 "TechSupport","StreamingTV","StreamingMovies"]
@@ -129,7 +121,6 @@ def build_aggregations(df):
             service_churn.append({"Service": svc, "Value": val, "ChurnRate": rate, "Count": len(sub)})
     service_df = pd.DataFrame(service_churn)
 
-    # -- Senior vs non-senior --------------------------------------------------
     by_senior = (df.groupby("SeniorCitizen")
                    .agg(Total=("ChurnFlag","count"),
                         Churned=("ChurnFlag","sum"))
@@ -137,7 +128,6 @@ def build_aggregations(df):
     by_senior["Label"] = by_senior["SeniorCitizen"].map({0:"Non-Senior", 1:"Senior"})
     by_senior["ChurnRate"] = by_senior["Churned"] / by_senior["Total"] * 100
 
-    # -- Paperless billing -----------------------------------------------------
     by_paperless = (df.groupby("PaperlessBilling")
                       .agg(Total=("ChurnFlag","count"),
                            Churned=("ChurnFlag","sum"))
@@ -157,11 +147,6 @@ def build_aggregations(df):
         by_senior=by_senior,
         by_paperless=by_paperless
     )
-
-
-# ==============================================================================
-# SECTION 3 -- FEATURE IMPORTANCE (Random Forest)
-# ==============================================================================
 
 def build_feature_importance(df):
     print("Running feature importance model...")
@@ -193,11 +178,6 @@ def build_feature_importance(df):
     print("[OK] Model done.")
     return importance_df
 
-
-# ==============================================================================
-# SECTION 4 -- DESIGN TOKENS
-# ==============================================================================
-
 BLUE    = "#185FA5"
 TEAL    = "#0F6E56"
 AMBER   = "#854F0B"
@@ -218,11 +198,6 @@ BADGE_COLORS = {
     "Strong":      GREEN,
     "Opportunity": BLUE,
 }
-
-
-# ==============================================================================
-# SECTION 5 -- CHART BUILDERS
-# ==============================================================================
 
 def base_layout(height=300, margin=None):
     m = margin or dict(l=10, r=10, t=30, b=10)
@@ -462,11 +437,6 @@ def chart_senior_vs_nonsenior(agg):
     fig.update_layout(**layout)
     return fig
 
-
-# ==============================================================================
-# SECTION 6 -- UI HELPERS
-# ==============================================================================
-
 def kpi_card(label, value, sub=None, color=TEXT):
     children = [
         html.P(label, style={
@@ -505,11 +475,6 @@ def section_card(title, content, extra=None):
         content
     ], style=style)
 
-
-# ==============================================================================
-# SECTION 7 -- STATIC CONTENT
-# ==============================================================================
-
 INSIGHTS = [
     ("Critical",    "Month-to-month contract customers churn at ~42% vs only 11% for one-year and 3% for two-year contracts. Contract length is the single biggest retention lever."),
     ("Critical",    "Fibre optic internet customers churn at nearly 2x the rate of DSL customers, suggesting a quality or value-perception problem with the premium tier."),
@@ -534,10 +499,6 @@ RECOMMENDATIONS = [
 ]
 
 
-# ==============================================================================
-# SECTION 8 -- BUILD DASH APP
-# ==============================================================================
-
 def build_app(df, agg, importance_df):
     kpis = agg["kpis"]
     app  = Dash(__name__, title="Churn & Retention Dashboard")
@@ -546,7 +507,6 @@ def build_app(df, agg, importance_df):
         "background":BG, "minHeight":"100vh", "fontFamily":FONT
     }, children=[
 
-        # ----- Header --------------------------------------------------------
         html.Div([
             html.Div([
                 html.H1("Churn & Retention Dashboard", style={
@@ -724,7 +684,6 @@ def build_app(df, agg, importance_df):
         ])
     ])
 
-    # -- Callbacks ------------------------------------------------------------
     @app.callback(
         Output("contract-chart", "figure"),
         Output("tenure-chart",   "figure"),
@@ -777,13 +736,7 @@ def build_app(df, agg, importance_df):
 
     return app
 
-
-# ==============================================================================
-# ENTRY POINT
-# ==============================================================================
-
 if __name__ == "__main__":
-    # Update this path to where you saved the Kaggle CSV
     CSV = r"WA_Fn-UseC_-Telco-Customer-Churn.csv"
 
     print("=" * 55)
