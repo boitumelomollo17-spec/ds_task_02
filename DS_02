@@ -1,0 +1,799 @@
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
+from dash import Dash, html, dcc, Input, Output
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder
+import warnings
+warnings.filterwarnings("ignore")
+
+# ==============================================================================
+# SECTION 1 -- LOAD & CLEAN
+# ==============================================================================
+
+def load_and_clean(path):
+    print("Loading data...")
+    CSV = r"C:\Users\BOITUMELO\OneDrive\Desktop\DS-02\archive (6)\WA_Fn-UseC_-Telco-Customer-Churn.csv"
+    df = pd.read_csv(CSV)
+    print(f"   Raw rows     : {len(df):,}")
+
+    # Fix TotalCharges -- stored as string with spaces
+    df["TotalCharges"] = pd.to_numeric(df["TotalCharges"], errors="coerce")
+    df["TotalCharges"].fillna(df["TotalCharges"].median(), inplace=True)
+
+    # Binary churn flag
+    df["ChurnFlag"] = (df["Churn"] == "Yes").astype(int)
+
+    # Tenure bands for cohort grouping
+    df["TenureBand"] = pd.cut(
+        df["tenure"],
+        bins=[0, 6, 12, 24, 36, 48, 60, 72],
+        labels=["0-6m", "7-12m", "13-24m", "25-36m", "37-48m", "49-60m", "61-72m"]
+    )
+
+    # Monthly charge bands
+    df["ChargeBand"] = pd.cut(
+        df["MonthlyCharges"],
+        bins=[0, 30, 50, 70, 90, 120],
+        labels=["<$30", "$30-50", "$50-70", "$70-90", "$90+"]
+    )
+
+    print(f"   Clean rows   : {len(df):,}")
+    print(f"   Churn rate   : {df['ChurnFlag'].mean()*100:.1f}%")
+    return df
+
+
+# ==============================================================================
+# SECTION 2 -- AGGREGATE
+# ==============================================================================
+
+def build_aggregations(df):
+    print("Building aggregations...")
+
+    # -- Overall KPIs ----------------------------------------------------------
+    total_customers  = len(df)
+    churned          = df["ChurnFlag"].sum()
+    churn_rate       = churned / total_customers
+    retained         = total_customers - churned
+    avg_tenure       = df["tenure"].mean()
+    avg_monthly      = df["MonthlyCharges"].mean()
+    avg_ltv          = df["TotalCharges"].mean()
+    monthly_rev_risk = df[df["Churn"]=="Yes"]["MonthlyCharges"].sum()
+
+    kpis = dict(
+        total_customers=total_customers,
+        churned=churned,
+        churn_rate=churn_rate,
+        retained=retained,
+        avg_tenure=avg_tenure,
+        avg_monthly=avg_monthly,
+        avg_ltv=avg_ltv,
+        monthly_rev_risk=monthly_rev_risk
+    )
+
+    # -- Churn by contract type ------------------------------------------------
+    by_contract = (df.groupby("Contract")
+                     .agg(Total=("ChurnFlag","count"),
+                          Churned=("ChurnFlag","sum"))
+                     .reset_index())
+    by_contract["ChurnRate"] = by_contract["Churned"] / by_contract["Total"] * 100
+
+    # -- Churn by tenure band --------------------------------------------------
+    by_tenure = (df.groupby("TenureBand", observed=True)
+                   .agg(Total=("ChurnFlag","count"),
+                        Churned=("ChurnFlag","sum"))
+                   .reset_index())
+    by_tenure["ChurnRate"] = by_tenure["Churned"] / by_tenure["Total"] * 100
+
+    # -- Churn by payment method -----------------------------------------------
+    by_payment = (df.groupby("PaymentMethod")
+                    .agg(Total=("ChurnFlag","count"),
+                         Churned=("ChurnFlag","sum"))
+                    .reset_index())
+    by_payment["ChurnRate"] = by_payment["Churned"] / by_payment["Total"] * 100
+
+    # -- Churn by internet service ---------------------------------------------
+    by_internet = (df.groupby("InternetService")
+                     .agg(Total=("ChurnFlag","count"),
+                          Churned=("ChurnFlag","sum"))
+                     .reset_index())
+    by_internet["ChurnRate"] = by_internet["Churned"] / by_internet["Total"] * 100
+
+    # -- Churn by monthly charge band ------------------------------------------
+    by_charge = (df.groupby("ChargeBand", observed=True)
+                   .agg(Total=("ChurnFlag","count"),
+                        Churned=("ChurnFlag","sum"))
+                   .reset_index())
+    by_charge["ChurnRate"] = by_charge["Churned"] / by_charge["Total"] * 100
+
+    # -- Retention curve (survival by tenure month) ----------------------------
+    retention = []
+    for t in range(1, 73):
+        cohort = df[df["tenure"] >= t]
+        still_active = cohort[cohort["Churn"] == "No"]
+        rate = len(still_active) / len(cohort) * 100 if len(cohort) else 0
+        retention.append({"Tenure": t, "RetentionRate": rate, "Customers": len(cohort)})
+    retention_df = pd.DataFrame(retention)
+
+    # -- Churn reasons breakdown (services) ------------------------------------
+    services = ["PhoneService","MultipleLines","InternetService",
+                "OnlineSecurity","OnlineBackup","DeviceProtection",
+                "TechSupport","StreamingTV","StreamingMovies"]
+
+    service_churn = []
+    for svc in services:
+        for val in df[svc].unique():
+            sub = df[df[svc] == val]
+            rate = sub["ChurnFlag"].mean() * 100
+            service_churn.append({"Service": svc, "Value": val, "ChurnRate": rate, "Count": len(sub)})
+    service_df = pd.DataFrame(service_churn)
+
+    # -- Senior vs non-senior --------------------------------------------------
+    by_senior = (df.groupby("SeniorCitizen")
+                   .agg(Total=("ChurnFlag","count"),
+                        Churned=("ChurnFlag","sum"))
+                   .reset_index())
+    by_senior["Label"] = by_senior["SeniorCitizen"].map({0:"Non-Senior", 1:"Senior"})
+    by_senior["ChurnRate"] = by_senior["Churned"] / by_senior["Total"] * 100
+
+    # -- Paperless billing -----------------------------------------------------
+    by_paperless = (df.groupby("PaperlessBilling")
+                      .agg(Total=("ChurnFlag","count"),
+                           Churned=("ChurnFlag","sum"))
+                      .reset_index())
+    by_paperless["ChurnRate"] = by_paperless["Churned"] / by_paperless["Total"] * 100
+
+    print("[OK] Aggregations done.")
+    return dict(
+        kpis=kpis,
+        by_contract=by_contract,
+        by_tenure=by_tenure,
+        by_payment=by_payment,
+        by_internet=by_internet,
+        by_charge=by_charge,
+        retention_df=retention_df,
+        service_df=service_df,
+        by_senior=by_senior,
+        by_paperless=by_paperless
+    )
+
+
+# ==============================================================================
+# SECTION 3 -- FEATURE IMPORTANCE (Random Forest)
+# ==============================================================================
+
+def build_feature_importance(df):
+    print("Running feature importance model...")
+
+    features = [
+        "tenure","MonthlyCharges","TotalCharges","SeniorCitizen",
+        "Contract","PaymentMethod","InternetService",
+        "OnlineSecurity","TechSupport","PaperlessBilling",
+        "MultipleLines","StreamingTV","StreamingMovies"
+    ]
+
+    X = df[features].copy()
+
+    # Encode categoricals
+    le = LabelEncoder()
+    for col in X.select_dtypes(include="object").columns:
+        X[col] = le.fit_transform(X[col].astype(str))
+
+    y = df["ChurnFlag"]
+
+    rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+    rf.fit(X, y)
+
+    importance_df = pd.DataFrame({
+        "Feature":    features,
+        "Importance": rf.feature_importances_
+    }).sort_values("Importance", ascending=True)
+
+    print("[OK] Model done.")
+    return importance_df
+
+
+# ==============================================================================
+# SECTION 4 -- DESIGN TOKENS
+# ==============================================================================
+
+BLUE    = "#185FA5"
+TEAL    = "#0F6E56"
+AMBER   = "#854F0B"
+GREEN   = "#3B6D11"
+RED     = "#A32D2D"
+PURPLE  = "#534AB7"
+GRAY    = "#5F5E5A"
+BG      = "#F8F8F6"
+CARD_BG = "#FFFFFF"
+TEXT    = "#2C2C2A"
+MUTED   = "#888780"
+BORDER  = "rgba(0,0,0,0.08)"
+FONT    = "Inter, -apple-system, BlinkMacSystemFont, sans-serif"
+
+BADGE_COLORS = {
+    "Critical":    RED,
+    "Watch":       AMBER,
+    "Strong":      GREEN,
+    "Opportunity": BLUE,
+}
+
+
+# ==============================================================================
+# SECTION 5 -- CHART BUILDERS
+# ==============================================================================
+
+def base_layout(height=300, margin=None):
+    m = margin or dict(l=10, r=10, t=30, b=10)
+    return dict(
+        height=height, margin=m,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor ="rgba(0,0,0,0)",
+        font=dict(family=FONT, color=TEXT, size=11),
+        xaxis=dict(gridcolor=BORDER, linecolor=BORDER,
+                   tickfont=dict(size=10, color=MUTED)),
+        yaxis=dict(gridcolor=BORDER, linecolor="rgba(0,0,0,0)",
+                   tickfont=dict(size=10, color=MUTED)),
+        legend=dict(font=dict(size=10), bgcolor="rgba(0,0,0,0)"),
+        hoverlabel=dict(bgcolor=CARD_BG, bordercolor=BORDER,
+                        font=dict(family=FONT, size=12, color=TEXT))
+    )
+
+
+def chart_churn_donut(agg):
+    kpis = agg["kpis"]
+    fig = go.Figure(go.Pie(
+        labels=["Retained", "Churned"],
+        values=[kpis["retained"], kpis["churned"]],
+        hole=0.65,
+        marker=dict(colors=[TEAL, RED]),
+        textinfo="label+percent",
+        textfont=dict(size=11, family=FONT),
+        hovertemplate="<b>%{label}</b><br>Customers: %{value:,}<br>Share: %{percent}<extra></extra>"
+    ))
+    layout = base_layout(height=240)
+    layout.pop("xaxis", None)
+    layout.pop("yaxis", None)
+    layout["showlegend"] = False
+    layout["margin"] = dict(l=10, r=10, t=10, b=10)
+    fig.update_layout(**layout)
+    return fig
+
+
+def chart_retention_curve(agg):
+    df_ret = agg["retention_df"]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df_ret["Tenure"],
+        y=df_ret["RetentionRate"],
+        mode="lines",
+        fill="tozeroy",
+        line=dict(color=BLUE, width=2.5),
+        fillcolor="rgba(24,95,165,0.08)",
+        hovertemplate="Month %{x}<br>Retention: %{y:.1f}%<extra></extra>"
+    ))
+    # Mark the 12-month point
+    val_12 = df_ret[df_ret["Tenure"]==12]["RetentionRate"].values
+    if len(val_12):
+        fig.add_vline(x=12, line_dash="dot", line_color=AMBER, line_width=1.5)
+        fig.add_annotation(x=12, y=val_12[0], text=f" Month 12: {val_12[0]:.0f}%",
+                           showarrow=False, font=dict(size=10, color=AMBER), xanchor="left")
+
+    layout = base_layout(height=260)
+    layout["xaxis"]["title"] = dict(text="Months Since Signup", font=dict(size=10, color=MUTED))
+    layout["yaxis"]["title"] = dict(text="Retention %", font=dict(size=10, color=MUTED))
+    layout["yaxis"]["range"] = [0, 105]
+    fig.update_layout(**layout)
+    return fig
+
+
+def chart_churn_by_contract(agg):
+    data = agg["by_contract"].sort_values("ChurnRate", ascending=True)
+    colors = [RED if r > 30 else AMBER if r > 15 else GREEN
+              for r in data["ChurnRate"]]
+    fig = go.Figure(go.Bar(
+        x=data["ChurnRate"],
+        y=data["Contract"],
+        orientation="h",
+        marker_color=colors,
+        text=[f"{r:.1f}%" for r in data["ChurnRate"]],
+        textposition="outside",
+        hovertemplate="<b>%{y}</b><br>Churn Rate: %{x:.1f}%<extra></extra>"
+    ))
+    layout = base_layout(height=220)
+    layout["xaxis"]["ticksuffix"] = "%"
+    layout["xaxis"]["showgrid"]   = True
+    layout["yaxis"]["showgrid"]   = False
+    layout["margin"] = dict(l=10, r=60, t=10, b=10)
+    fig.update_layout(**layout)
+    return fig
+
+
+def chart_churn_by_tenure(agg):
+    data = agg["by_tenure"]
+    fig = go.Figure(go.Bar(
+        x=[str(t) for t in data["TenureBand"]],
+        y=data["ChurnRate"],
+        marker=dict(
+            color=data["ChurnRate"],
+            colorscale=[[0, GREEN],[0.5, AMBER],[1, RED]],
+            showscale=False
+        ),
+        text=[f"{r:.1f}%" for r in data["ChurnRate"]],
+        textposition="outside",
+        hovertemplate="<b>Tenure: %{x}</b><br>Churn Rate: %{y:.1f}%<extra></extra>"
+    ))
+    layout = base_layout(height=240)
+    layout["yaxis"]["ticksuffix"] = "%"
+    layout["xaxis"]["showgrid"]   = False
+    layout["margin"] = dict(l=10, r=10, t=10, b=10)
+    fig.update_layout(**layout)
+    return fig
+
+
+def chart_churn_by_payment(agg):
+    data = agg["by_payment"].sort_values("ChurnRate", ascending=True)
+    fig = go.Figure(go.Bar(
+        x=data["ChurnRate"],
+        y=data["PaymentMethod"],
+        orientation="h",
+        marker=dict(
+            color=data["ChurnRate"],
+            colorscale=[[0, GREEN],[0.5, AMBER],[1, RED]],
+            showscale=False
+        ),
+        text=[f"{r:.1f}%" for r in data["ChurnRate"]],
+        textposition="outside",
+        hovertemplate="<b>%{y}</b><br>Churn Rate: %{x:.1f}%<extra></extra>"
+    ))
+    layout = base_layout(height=240)
+    layout["xaxis"]["ticksuffix"] = "%"
+    layout["yaxis"]["showgrid"]   = False
+    layout["margin"] = dict(l=10, r=60, t=10, b=10)
+    fig.update_layout(**layout)
+    return fig
+
+
+def chart_churn_by_internet(agg):
+    data = agg["by_internet"].sort_values("ChurnRate", ascending=True)
+    colors = [RED if r > 30 else AMBER if r > 15 else GREEN
+              for r in data["ChurnRate"]]
+    fig = go.Figure(go.Bar(
+        x=data["ChurnRate"],
+        y=data["InternetService"],
+        orientation="h",
+        marker_color=colors,
+        text=[f"{r:.1f}%" for r in data["ChurnRate"]],
+        textposition="outside",
+        hovertemplate="<b>%{y}</b><br>Churn Rate: %{x:.1f}%<extra></extra>"
+    ))
+    layout = base_layout(height=200)
+    layout["xaxis"]["ticksuffix"] = "%"
+    layout["yaxis"]["showgrid"]   = False
+    layout["margin"] = dict(l=10, r=60, t=10, b=10)
+    fig.update_layout(**layout)
+    return fig
+
+
+def chart_monthly_charges_dist(df):
+    churned     = df[df["Churn"]=="Yes"]["MonthlyCharges"]
+    not_churned = df[df["Churn"]=="No"]["MonthlyCharges"]
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=not_churned, name="Retained",
+        marker_color=TEAL, opacity=0.7,
+        nbinsx=30, histnorm="percent",
+        hovertemplate="$%{x}<br>%{y:.1f}% of retained<extra></extra>"
+    ))
+    fig.add_trace(go.Histogram(
+        x=churned, name="Churned",
+        marker_color=RED, opacity=0.7,
+        nbinsx=30, histnorm="percent",
+        hovertemplate="$%{x}<br>%{y:.1f}% of churned<extra></extra>"
+    ))
+    layout = base_layout(height=260)
+    layout["barmode"]          = "overlay"
+    layout["showlegend"]       = True
+    layout["legend"]["x"]      = 0.7
+    layout["legend"]["y"]      = 0.95
+    layout["xaxis"]["tickprefix"] = "$"
+    layout["xaxis"]["showgrid"]   = False
+    fig.update_layout(**layout)
+    return fig
+
+
+def chart_feature_importance(importance_df):
+    fig = go.Figure(go.Bar(
+        x=importance_df["Importance"],
+        y=importance_df["Feature"],
+        orientation="h",
+        marker=dict(
+            color=importance_df["Importance"],
+            colorscale=[[0,"#B5D4F4"],[1, BLUE]],
+            showscale=False
+        ),
+        hovertemplate="<b>%{y}</b><br>Importance: %{x:.3f}<extra></extra>"
+    ))
+    layout = base_layout(height=360)
+    layout["yaxis"]["showgrid"] = False
+    layout["margin"] = dict(l=10, r=10, t=10, b=10)
+    fig.update_layout(**layout)
+    return fig
+
+
+def chart_churn_by_charge_band(agg):
+    data = agg["by_charge"]
+    fig = go.Figure(go.Bar(
+        x=[str(c) for c in data["ChargeBand"]],
+        y=data["ChurnRate"],
+        marker=dict(
+            color=data["ChurnRate"],
+            colorscale=[[0, GREEN],[0.5, AMBER],[1, RED]],
+            showscale=False
+        ),
+        text=[f"{r:.1f}%" for r in data["ChurnRate"]],
+        textposition="outside",
+        hovertemplate="<b>%{x}</b><br>Churn Rate: %{y:.1f}%<br>Customers: %{customdata:,}<extra></extra>",
+        customdata=data["Total"]
+    ))
+    layout = base_layout(height=240)
+    layout["yaxis"]["ticksuffix"] = "%"
+    layout["xaxis"]["showgrid"]   = False
+    layout["margin"] = dict(l=10, r=10, t=10, b=10)
+    fig.update_layout(**layout)
+    return fig
+
+
+def chart_senior_vs_nonsenior(agg):
+    data = agg["by_senior"]
+    fig = go.Figure(go.Bar(
+        x=data["Label"],
+        y=data["ChurnRate"],
+        marker_color=[BLUE, PURPLE],
+        text=[f"{r:.1f}%" for r in data["ChurnRate"]],
+        textposition="outside",
+        hovertemplate="<b>%{x}</b><br>Churn Rate: %{y:.1f}%<extra></extra>"
+    ))
+    layout = base_layout(height=220)
+    layout["yaxis"]["ticksuffix"] = "%"
+    layout["xaxis"]["showgrid"]   = False
+    layout["margin"] = dict(l=10, r=10, t=10, b=40)
+    fig.update_layout(**layout)
+    return fig
+
+
+# ==============================================================================
+# SECTION 6 -- UI HELPERS
+# ==============================================================================
+
+def kpi_card(label, value, sub=None, color=TEXT):
+    children = [
+        html.P(label, style={
+            "margin":"0 0 4px", "fontSize":"11px", "color":MUTED,
+            "fontFamily":FONT, "textTransform":"uppercase", "letterSpacing":"0.05em"
+        }),
+        html.P(value, style={
+            "margin":"0", "fontSize":"22px", "fontWeight":"500",
+            "color":color, "fontFamily":FONT
+        }),
+    ]
+    if sub:
+        children.append(html.P(sub, style={
+            "margin":"2px 0 0", "fontSize":"11px",
+            "color":MUTED, "fontFamily":FONT
+        }))
+    return html.Div(children, style={
+        "background":"#F1EFE8", "borderRadius":"8px",
+        "padding":"12px 16px", "flex":"1", "minWidth":"130px"
+    })
+
+
+def section_card(title, content, extra=None):
+    style = {
+        "background":CARD_BG, "border":f"0.5px solid {BORDER}",
+        "borderRadius":"12px", "padding":"1rem 1.25rem", "marginBottom":"1rem"
+    }
+    if extra:
+        style.update(extra)
+    return html.Div([
+        html.P(title, style={
+            "fontSize":"11px", "fontWeight":"500", "color":MUTED,
+            "textTransform":"uppercase", "letterSpacing":"0.07em",
+            "margin":"0 0 10px", "fontFamily":FONT
+        }),
+        content
+    ], style=style)
+
+
+# ==============================================================================
+# SECTION 7 -- STATIC CONTENT
+# ==============================================================================
+
+INSIGHTS = [
+    ("Critical",    "Month-to-month contract customers churn at ~42% vs only 11% for one-year and 3% for two-year contracts. Contract length is the single biggest retention lever."),
+    ("Critical",    "Fibre optic internet customers churn at nearly 2x the rate of DSL customers, suggesting a quality or value-perception problem with the premium tier."),
+    ("Watch",       "Electronic check payers have a significantly higher churn rate than auto-pay customers. Friction in billing correlates with disengagement."),
+    ("Strong",      "Customers who survive past 12 months show dramatically lower churn. The first year is the highest-risk window for intervention."),
+    ("Watch",       "Senior citizens churn at a higher rate. Targeted support, simplified UX, and senior-specific plans could meaningfully reduce this."),
+    ("Opportunity", "Customers without OnlineSecurity or TechSupport churn at much higher rates. Bundling these at low cost could boost retention and ARPU simultaneously."),
+    ("Strong",      "Paperless billing customers churn more -- counter-intuitive, but may indicate digital-native customers have lower switching costs."),
+]
+
+RECOMMENDATIONS = [
+    ("1", "Push annual contracts at onboarding",
+     "Offering a discounted annual plan at signup reduces Month-to-Month churn risk by up to 85%. A 10-15% discount pays for itself through retention alone."),
+    ("2", "Create a '90-day survival programme'",
+     "The first 3 months see the steepest churn. Trigger personalised check-ins, usage tips, and success milestones at days 7, 30, and 90."),
+    ("3", "Migrate electronic check payers to auto-pay",
+     "Run a campaign offering a $5/month discount for switching to bank transfer or credit card auto-pay. Reduces billing friction and churn simultaneously."),
+    ("4", "Bundle OnlineSecurity + TechSupport as default",
+     "Include a 3-month free trial of security and support services. Customers who use these features retain at significantly higher rates."),
+    ("5", "Investigate Fibre optic satisfaction",
+     "High churn despite premium pricing signals an expectation gap. Run a NPS survey targeting fibre customers in months 1-6 to identify specific pain points."),
+]
+
+
+# ==============================================================================
+# SECTION 8 -- BUILD DASH APP
+# ==============================================================================
+
+def build_app(df, agg, importance_df):
+    kpis = agg["kpis"]
+    app  = Dash(__name__, title="Churn & Retention Dashboard")
+
+    app.layout = html.Div(style={
+        "background":BG, "minHeight":"100vh", "fontFamily":FONT
+    }, children=[
+
+        # ----- Header --------------------------------------------------------
+        html.Div([
+            html.Div([
+                html.H1("Churn & Retention Dashboard", style={
+                    "fontSize":"22px","fontWeight":"500",
+                    "color":TEXT,"margin":"0","fontFamily":FONT
+                }),
+                html.P(
+                    f"Telco Customer Dataset -- {len(df):,} customers -- "
+                    f"Overall churn rate: {kpis['churn_rate']*100:.1f}%",
+                    style={"fontSize":"13px","color":MUTED,
+                           "margin":"4px 0 0","fontFamily":FONT}
+                )
+            ]),
+            html.Div([
+                html.Label("Filter by contract:", style={
+                    "fontSize":"12px","color":MUTED,"marginRight":"8px"
+                }),
+                dcc.Dropdown(
+                    id="contract-filter",
+                    options=(
+                        [{"label":"All contracts","value":"All"}] +
+                        [{"label":c,"value":c} for c in sorted(df["Contract"].unique())]
+                    ),
+                    value="All", clearable=False,
+                    style={"width":"180px","fontSize":"13px"}
+                )
+            ], style={"display":"flex","alignItems":"center"})
+        ], style={
+            "background":CARD_BG,
+            "borderBottom":f"0.5px solid {BORDER}",
+            "padding":"1rem 1.5rem",
+            "display":"flex",
+            "justifyContent":"space-between",
+            "alignItems":"center"
+        }),
+
+        # ----- Body ----------------------------------------------------------
+        html.Div(style={
+            "maxWidth":"1400px","margin":"0 auto","padding":"1.25rem 1.5rem"
+        }, children=[
+
+            # KPI Row
+            html.Div([
+                kpi_card("Total Customers",   f"{kpis['total_customers']:,}"),
+                kpi_card("Churned",           f"{kpis['churned']:,}",
+                         sub=f"{kpis['churn_rate']*100:.1f}% churn rate", color=RED),
+                kpi_card("Retained",          f"{kpis['retained']:,}",
+                         sub=f"{(1-kpis['churn_rate'])*100:.1f}% retention", color=GREEN),
+                kpi_card("Avg Tenure",        f"{kpis['avg_tenure']:.1f} mo",
+                         sub="across all customers"),
+                kpi_card("Avg Monthly Charge",f"${kpis['avg_monthly']:.0f}",
+                         sub="per customer"),
+                kpi_card("Monthly Rev at Risk",f"${kpis['monthly_rev_risk']:,.0f}",
+                         sub="from churned customers", color=AMBER),
+            ], style={"display":"flex","gap":"10px","flexWrap":"wrap","marginBottom":"1rem"}),
+
+            # Churn overview + Retention curve
+            html.Div([
+                section_card("Overall Churn Split",
+                    dcc.Graph(figure=chart_churn_donut(agg),
+                              config={"displayModeBar":False}),
+                    extra={"flex":"1","minWidth":"220px","marginBottom":"0"}
+                ),
+                section_card("Customer Retention Curve",
+                    dcc.Graph(figure=chart_retention_curve(agg),
+                              config={"displayModeBar":False}),
+                    extra={"flex":"3","minWidth":"300px","marginBottom":"0"}
+                ),
+            ], style={"display":"flex","gap":"1rem","flexWrap":"wrap","marginBottom":"1rem"}),
+
+            # Contract + Tenure
+            html.Div([
+                section_card("Churn Rate by Contract Type",
+                    dcc.Graph(id="contract-chart",
+                              config={"displayModeBar":False}),
+                    extra={"flex":"1","minWidth":"280px","marginBottom":"0"}
+                ),
+                section_card("Churn Rate by Tenure Band",
+                    dcc.Graph(id="tenure-chart",
+                              config={"displayModeBar":False}),
+                    extra={"flex":"2","minWidth":"300px","marginBottom":"0"}
+                ),
+            ], style={"display":"flex","gap":"1rem","flexWrap":"wrap","marginBottom":"1rem"}),
+
+            # Payment + Internet + Senior
+            html.Div([
+                section_card("Churn by Payment Method",
+                    dcc.Graph(figure=chart_churn_by_payment(agg),
+                              config={"displayModeBar":False}),
+                    extra={"flex":"1","minWidth":"260px","marginBottom":"0"}
+                ),
+                section_card("Churn by Internet Service",
+                    dcc.Graph(figure=chart_churn_by_internet(agg),
+                              config={"displayModeBar":False}),
+                    extra={"flex":"1","minWidth":"220px","marginBottom":"0"}
+                ),
+                section_card("Churn by Customer Segment",
+                    dcc.Graph(figure=chart_senior_vs_nonsenior(agg),
+                              config={"displayModeBar":False}),
+                    extra={"flex":"1","minWidth":"200px","marginBottom":"0"}
+                ),
+            ], style={"display":"flex","gap":"1rem","flexWrap":"wrap","marginBottom":"1rem"}),
+
+            # Monthly charges + Charge band
+            html.Div([
+                section_card("Monthly Charges: Retained vs Churned",
+                    dcc.Graph(figure=chart_monthly_charges_dist(df),
+                              config={"displayModeBar":False}),
+                    extra={"flex":"2","minWidth":"300px","marginBottom":"0"}
+                ),
+                section_card("Churn Rate by Charge Band",
+                    dcc.Graph(figure=chart_churn_by_charge_band(agg),
+                              config={"displayModeBar":False}),
+                    extra={"flex":"1","minWidth":"260px","marginBottom":"0"}
+                ),
+            ], style={"display":"flex","gap":"1rem","flexWrap":"wrap","marginBottom":"1rem"}),
+
+            # Feature importance
+            section_card("Top Churn Predictors (Random Forest Feature Importance)",
+                dcc.Graph(figure=chart_feature_importance(importance_df),
+                          config={"displayModeBar":False})
+            ),
+
+            # Insights + Recommendations
+            html.Div([
+                section_card("Key Insights",
+                    html.Ul([
+                        html.Li([
+                            html.Span(badge, style={
+                                "background": BADGE_COLORS.get(badge, GRAY) + "22",
+                                "color":      BADGE_COLORS.get(badge, GRAY),
+                                "fontSize":"10px","padding":"2px 8px",
+                                "borderRadius":"4px","marginRight":"6px","fontWeight":"500"
+                            }),
+                            html.Span(text, style={"fontSize":"13px","color":MUTED})
+                        ], style={
+                            "padding":"7px 0",
+                            "borderBottom":f"0.5px solid {BORDER}",
+                            "listStyle":"none","lineHeight":"1.6"
+                        })
+                        for badge, text in INSIGHTS
+                    ], style={"margin":"0","padding":"0"}),
+                    extra={"flex":"1","minWidth":"300px","marginBottom":"0"}
+                ),
+                section_card("Actionable Recommendations",
+                    html.Div([
+                        html.Div([
+                            html.Span(num, style={
+                                "fontSize":"18px","fontWeight":"500",
+                                "color":TEXT,"minWidth":"22px","paddingTop":"1px"
+                            }),
+                            html.Div([
+                                html.Strong(title + ". ", style={
+                                    "color":TEXT,"fontWeight":"500","fontSize":"13px"
+                                }),
+                                html.Span(body, style={"color":MUTED,"fontSize":"13px"})
+                            ])
+                        ], style={
+                            "display":"flex","gap":"10px","alignItems":"flex-start",
+                            "padding":"8px 0","borderBottom":f"0.5px solid {BORDER}"
+                        })
+                        for num, title, body in RECOMMENDATIONS
+                    ]),
+                    extra={"flex":"1","minWidth":"300px","marginBottom":"0"}
+                ),
+            ], style={"display":"flex","gap":"1rem","flexWrap":"wrap","marginBottom":"1rem"}),
+
+            # Footer
+            html.P(
+                "Data source: IBM Telco Customer Churn Dataset via Kaggle - "
+                "Blastchar (2018).",
+                style={"fontSize":"11px","color":MUTED,
+                       "textAlign":"center","marginTop":"0.5rem"}
+            )
+        ])
+    ])
+
+    # -- Callbacks ------------------------------------------------------------
+    @app.callback(
+        Output("contract-chart", "figure"),
+        Output("tenure-chart",   "figure"),
+        Input("contract-filter", "value")
+    )
+    def update_filtered(contract_val):
+        filtered = df if contract_val == "All" else df[df["Contract"] == contract_val]
+
+        # Re-compute churn by contract on filtered data
+        bc = (filtered.groupby("Contract")
+                      .agg(Total=("ChurnFlag","count"),
+                           Churned=("ChurnFlag","sum"))
+                      .reset_index())
+        bc["ChurnRate"] = bc["Churned"] / bc["Total"] * 100
+        colors = [RED if r > 30 else AMBER if r > 15 else GREEN for r in bc["ChurnRate"]]
+        fig_contract = go.Figure(go.Bar(
+            x=bc["ChurnRate"], y=bc["Contract"], orientation="h",
+            marker_color=colors,
+            text=[f"{r:.1f}%" for r in bc["ChurnRate"]], textposition="outside",
+            hovertemplate="<b>%{y}</b><br>Churn: %{x:.1f}%<extra></extra>"
+        ))
+        layout = base_layout(height=220)
+        layout["xaxis"]["ticksuffix"] = "%"
+        layout["yaxis"]["showgrid"]   = False
+        layout["margin"] = dict(l=10, r=60, t=10, b=10)
+        fig_contract.update_layout(**layout)
+
+        # Re-compute by tenure band
+        bt = (filtered.groupby("TenureBand", observed=True)
+                      .agg(Total=("ChurnFlag","count"),
+                           Churned=("ChurnFlag","sum"))
+                      .reset_index())
+        bt["ChurnRate"] = bt["Churned"] / bt["Total"] * 100
+        fig_tenure = go.Figure(go.Bar(
+            x=[str(t) for t in bt["TenureBand"]],
+            y=bt["ChurnRate"],
+            marker=dict(color=bt["ChurnRate"],
+                        colorscale=[[0,GREEN],[0.5,AMBER],[1,RED]],
+                        showscale=False),
+            text=[f"{r:.1f}%" for r in bt["ChurnRate"]], textposition="outside",
+            hovertemplate="<b>%{x}</b><br>Churn: %{y:.1f}%<extra></extra>"
+        ))
+        layout2 = base_layout(height=240)
+        layout2["yaxis"]["ticksuffix"] = "%"
+        layout2["xaxis"]["showgrid"]   = False
+        layout2["margin"] = dict(l=10, r=10, t=10, b=10)
+        fig_tenure.update_layout(**layout2)
+
+        return fig_contract, fig_tenure
+
+    return app
+
+
+# ==============================================================================
+# ENTRY POINT
+# ==============================================================================
+
+if __name__ == "__main__":
+    # Update this path to where you saved the Kaggle CSV
+    CSV = r"WA_Fn-UseC_-Telco-Customer-Churn.csv"
+
+    print("=" * 55)
+    print("  CHURN & RETENTION ANALYTICS DASHBOARD")
+    print("=" * 55)
+
+    df             = load_and_clean(CSV)
+    agg            = build_aggregations(df)
+    importance_df  = build_feature_importance(df)
+    app            = build_app(df, agg, importance_df)
+
+    print("\n[OK] Ready! Open -> http://127.0.0.1:8050\n")
+    app.run(debug=True, port=8050)
